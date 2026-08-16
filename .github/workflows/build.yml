@@ -1,0 +1,71 @@
+# .github/workflows/build_dylib.yml
+name: Build iOS dylib (Aimlock FreeFire)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest   # GitHub cung cấp macOS với Xcode & SDK iOS
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Tạo thư mục và mã nguồn
+        run: |
+          mkdir -p src
+          cat > src/aimlock.c << 'EOF'
+          #include <stdio.h>
+          #include <time.h>
+          #include <unistd.h>
+          #include <dlfcn.h>
+
+          __attribute__((constructor)) void init_aimlock() {
+              FILE *log = fopen("/tmp/aimlock_log.txt", "w");
+              if (log) {
+                  time_t t = time(NULL);
+                  fprintf(log, "Aimlock enabled at %ld\n", (long)t);
+                  fclose(log);
+              }
+              // Thay địa chỉ offset bằng địa chỉ thực tế sau khi reverse game
+              // uintptr_t base = (uintptr_t)dlopen(NULL, RTLD_NOW);
+              // *(uint32_t*)(base + 0x123456) = 0xFFFFFFFF;
+          }
+          EOF
+
+      - name: Biên dịch dylib với Xcode toolchain
+        run: |
+          export SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          export CC=$(xcrun --sdk iphoneos -f clang)
+          export CXX=$(xcrun --sdk iphoneos -f clang++)
+          $CC -arch arm64 -dynamiclib -isysroot $SDKROOT -miphoneos-version-min=14.0 \
+              -Wl,-undefined,dynamic_lookup -O2 -o aimlock.dylib src/aimlock.c
+
+      - name: Kiểm tra file output
+        run: file aimlock.dylib && ls -la aimlock.dylib
+
+      - name: Upload dylib dưới dạng artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aimlock-FreeFire-iOS
+          path: aimlock.dylib
+
+      - name: Tạo hướng dẫn tiêm (inject_guide.txt)
+        run: |
+          cat > inject_guide.txt << 'EOF'
+          === HƯỚNG DẪN TIÊM DYLIB QUA TROLLFOOLS ===
+          1. Tải file aimlock.dylib từ GitHub Actions (phần Artifacts).
+          2. Chuyển file vào iOS (AirDrop, iCloud, hoặc URL).
+          3. Mở TrollFools -> chọn FreeFire -> Inject -> chọn file aimlock.dylib.
+          4. Khởi động lại FreeFire.
+          5. Kiểm tra log: cat /tmp/aimlock_log.txt (nếu có).
+          EOF
+          cat inject_guide.txt
+
+      - name: Upload hướng dẫn (tuỳ chọn)
+        uses: actions/upload-artifact@v4
+        with:
+          name: inject_guide
+          path: inject_guide.txt
