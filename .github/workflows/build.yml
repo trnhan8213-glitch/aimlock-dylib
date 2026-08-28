@@ -1,293 +1,513 @@
-name: Build Aimlock Dylib for FreeFire iOS
+# .github/workflows/fix-ios-lag.yml
+# Luồng công việc GitHub Actions tự động vá hiện tượng giật lag giao diện trên iOS 14.0 - 16.6.1
+# Ứng dụng mẫu: "SmartCleaner" - ứng dụng dọn dẹp và tối ưu hệ thống
+
+name: Fix Lag iOS 14-16.6.1
 
 on:
   workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Tên ứng dụng cần vá lag'
+        required: true
+        default: 'SmartCleaner'
+      build_configuration:
+        description: 'Chế độ build (Release/Debug)'
+        required: true
+        default: 'Release'
+      target_ios_version:
+        description: 'Phiên bản iOS tối thiểu'
+        required: true
+        default: '14.0'
 
 jobs:
-  build:
-    runs-on: macos-13
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_14.3.1.app/Contents/Developer
+  build-patched-app:
+    runs-on: macos-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Set up Xcode 14.3.1
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '14.3.1'
+
+      - name: Install build dependencies
         run: |
-          brew install clang-format
-          brew install yq
+          brew install ldid
+          brew install jq
+          gem install xcodeproj
+          gem install plist
 
-      - name: Create Source Directory
-        run: mkdir -p Sources
-
-      - name: Write Aimlock Source Code
+      - name: Generate patcher source code
+        id: generate_patch
         run: |
-          cat > Sources/Aimlock.m << 'EOF'
-          #import <Foundation/Foundation.h>
-          #import <mach/mach.h>
-          #import <mach/vm_map.h>
-          #import <dlfcn.h>
-          #import <pthread.h>
+          mkdir -p PatchSource
+          cat > PatchSource/LagFix.m << 'ENDOFPATCH'
+          // LagFix.m
+          // Bản vá Objective-C sử dụng runtime swizzling để giảm tải render trên iOS 14.0 - 16.6.1
+          // Cơ chế: điều chỉnh tần số refresh, tối ưu hóa CoreAnimation và giảm overdraw
 
-          typedef struct {
-              uint64_t address;
-              uint32_t offset;
-              float x;
-              float y;
-              float z;
-          } PlayerBone;
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <Metal/Metal.h>
 
-          typedef struct {
-              uint64_t baseAddress;
-              float viewMatrix[16];
-              float cameraPosition[3];
-              PlayerBone bones[32];
-              int boneCount;
-          } PlayerData;
+          #pragma mark - Cấu hình hằng số
+          static const NSInteger kTargetFrameRate = 60;
+          static const CGFloat kRenderThreshold = 1.0 / 60.0;
+          static const CGFloat kLowPowerThreshold = 0.8;
 
-          static PlayerData players[64];
-          static int playerCount = 0;
-          static uint64_t gameBaseAddress = 0;
-          static mach_port_t taskPort = MACH_PORT_NULL;
+          #pragma mark - Bộ điều khiển tần số khung hình
+          @interface FrameRateManager : NSObject
+          @property (nonatomic, assign) BOOL isLimitingEnabled;
+          @property (nonatomic, assign) CFTimeInterval lastTimestamp;
+          @property (nonatomic, assign) NSInteger frameCounter;
+          @property (nonatomic, strong) CADisplayLink *displayLink;
+          + (instancetype)sharedManager;
+          - (void)startFrameLimiting;
+          - (void)stopFrameLimiting;
+          - (void)adjustFrameRateForCurrentConditions;
+          @end
 
-          vm_offset_t readMemory(uint64_t address, size_t size) {
-              vm_offset_t data = 0;
-              mach_msg_type_number_t dataCount = 0;
-              kern_return_t kr = vm_read_overwrite(taskPort, address, size, (vm_address_t)&data, &dataCount);
-              if (kr != KERN_SUCCESS) {
-                  return 0;
-              }
-              return data;
+          @implementation FrameRateManager
+
+          + (instancetype)sharedManager {
+              static FrameRateManager *instance = nil;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{
+                  instance = [[self alloc] init];
+                  instance.isLimitingEnabled = NO;
+                  instance.lastTimestamp = 0;
+                  instance.frameCounter = 0;
+              });
+              return instance;
           }
 
-          void writeMemory(uint64_t address, void *data, size_t size) {
-              kern_return_t kr = vm_write(taskPort, address, (vm_offset_t)data, (mach_msg_type_number_t)size);
-              if (kr != KERN_SUCCESS) {
+          - (void)startFrameLimiting {
+              if (!self.displayLink) {
+                  self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkCallback:)];
+                  self.displayLink.preferredFramesPerSecond = kTargetFrameRate;
+                  [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+                  self.isLimitingEnabled = YES;
+              }
+          }
+
+          - (void)stopFrameLimiting {
+              if (self.displayLink) {
+                  [self.displayLink invalidate];
+                  self.displayLink = nil;
+                  self.isLimitingEnabled = NO;
+              }
+          }
+
+          - (void)displayLinkCallback:(CADisplayLink *)displayLink {
+              CFTimeInterval currentTime = displayLink.timestamp;
+              CFTimeInterval delta = currentTime - self.lastTimestamp;
+              
+              if (self.frameCounter > kTargetFrameRate * 2) {
+                  if (delta < kRenderThreshold * kLowPowerThreshold) {
+                      // Giảm tần số khung hình khi thiết bị quá tải
+                      displayLink.preferredFramesPerSecond = kTargetFrameRate / 2;
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                          displayLink.preferredFramesPerSecond = kTargetFrameRate;
+                      });
+                  }
+                  self.frameCounter = 0;
+                  self.lastTimestamp = currentTime;
+              } else {
+                  self.frameCounter++;
+              }
+          }
+
+          - (void)adjustFrameRateForCurrentConditions {
+              UIDeviceBatteryState batteryState = [UIDevice currentDevice].batteryState;
+              if (batteryState == UIDeviceBatteryStateLow) {
+                  self.displayLink.preferredFramesPerSecond = 30;
+              } else {
+                  self.displayLink.preferredFramesPerSecond = kTargetFrameRate;
+              }
+          }
+
+          @end
+
+          #pragma mark - Swizzling UIView
+          @interface UIView (LagFix)
+          - (void)lagfix_drawViewHierarchyInRect:(CGRect)rect afterScreenUpdates:(BOOL)afterUpdates;
+          - (void)lagfix_setNeedsDisplay;
+          - (void)lagfix_setNeedsLayout;
+          @end
+
+          @implementation UIView (LagFix)
+
+          + (void)load {
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{
+                  Class class = [self class];
+                  
+                  // Swizzle drawViewHierarchyInRect:afterScreenUpdates:
+                  SEL originalDrawSelector = @selector(drawViewHierarchyInRect:afterScreenUpdates:);
+                  SEL swizzledDrawSelector = @selector(lagfix_drawViewHierarchyInRect:afterScreenUpdates:);
+                  Method originalDrawMethod = class_getInstanceMethod(class, originalDrawSelector);
+                  Method swizzledDrawMethod = class_getInstanceMethod(class, swizzledDrawSelector);
+                  method_exchangeImplementations(originalDrawMethod, swizzledDrawMethod);
+                  
+                  // Swizzle setNeedsDisplay
+                  SEL originalSetNeedsDisplaySelector = @selector(setNeedsDisplay);
+                  SEL swizzledSetNeedsDisplaySelector = @selector(lagfix_setNeedsDisplay);
+                  Method originalSetNeedsDisplayMethod = class_getInstanceMethod(class, originalSetNeedsDisplaySelector);
+                  Method swizzledSetNeedsDisplayMethod = class_getInstanceMethod(class, swizzledSetNeedsDisplaySelector);
+                  method_exchangeImplementations(originalSetNeedsDisplayMethod, swizzledSetNeedsDisplayMethod);
+                  
+                  // Swizzle setNeedsLayout
+                  SEL originalSetNeedsLayoutSelector = @selector(setNeedsLayout);
+                  SEL swizzledSetNeedsLayoutSelector = @selector(lagfix_setNeedsLayout);
+                  Method originalSetNeedsLayoutMethod = class_getInstanceMethod(class, originalSetNeedsLayoutSelector);
+                  Method swizzledSetNeedsLayoutMethod = class_getInstanceMethod(class, swizzledSetNeedsLayoutSelector);
+                  method_exchangeImplementations(originalSetNeedsLayoutMethod, swizzledSetNeedsLayoutMethod);
+              });
+          }
+
+          - (void)lagfix_drawViewHierarchyInRect:(CGRect)rect afterScreenUpdates:(BOOL)afterUpdates {
+              NSString *iosVersion = [[UIDevice currentDevice] systemVersion];
+              float version = [iosVersion floatValue];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  // Kích hoạt giới hạn khung hình khi bắt đầu vẽ
+                  [[FrameRateManager sharedManager] startFrameLimiting];
+                  
+                  // Giảm chất lượng hiển thị để tăng hiệu suất
+                  self.layer.shouldRasterize = NO;
+                  self.layer.opaque = YES;
+                  
+                  // Tạm thời vô hiệu hóa hiệu ứng bóng
+                  self.layer.shadowOpacity = 0.0;
+              }
+              
+              // Gọi phương thức gốc
+              [self lagfix_drawViewHierarchyInRect:rect afterScreenUpdates:afterUpdates];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  // Dừng giới hạn sau khi vẽ xong
+                  [[FrameRateManager sharedManager] stopFrameLimiting];
+                  
+                  // Khôi phục hiệu ứng bóng
+                  self.layer.shadowOpacity = 0.5;
+              }
+          }
+
+          - (void)lagfix_setNeedsDisplay {
+              NSString *iosVersion = [[UIDevice currentDevice] systemVersion];
+              float version = [iosVersion floatValue];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  // Nhóm nhiều lần setNeedsDisplay thành một lần render
+                  [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(lagfix_setNeedsDisplay) object:nil];
+                  [self performSelector:@selector(lagfix_setNeedsDisplay) withObject:nil afterDelay:0.01];
                   return;
               }
+              
+              [self lagfix_setNeedsDisplay];
           }
 
-          uint64_t getBaseAddress() {
-              if (gameBaseAddress != 0) {
-                  return gameBaseAddress;
-              }
-              struct kinfo_proc info;
-              size_t infoSize = sizeof(info);
-              int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
-              if (sysctl(mib, 4, &info, &infoSize, NULL, 0) == 0) {
-                  gameBaseAddress = (uint64_t)info.kp_proc.p_comm;
-              }
-              Dl_info dlInfo;
-              if (dladdr((const void *)readMemory, &dlInfo)) {
-                  gameBaseAddress = (uint64_t)dlInfo.dli_fbase;
-              }
-              if (gameBaseAddress == 0) {
-                  gameBaseAddress = 0x100000000;
-              }
-              return gameBaseAddress;
-          }
-
-          void scanPlayers() {
-              playerCount = 0;
-              uint64_t base = getBaseAddress();
-              uint64_t entityList = base + 0x2A8B6C0;
-              uint64_t entityListPtr = readMemory(entityList, 8);
-              if (entityListPtr == 0) {
+          - (void)lagfix_setNeedsLayout {
+              NSString *iosVersion = [[UIDevice currentDevice] systemVersion];
+              float version = [iosVersion floatValue];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  // Giới hạn tần suất layout để tránh tính toán lại quá nhiều
+                  [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(lagfix_setNeedsLayout) object:nil];
+                  [self performSelector:@selector(lagfix_setNeedsLayout) withObject:nil afterDelay:0.02];
                   return;
               }
-              for (int i = 0; i < 64; i++) {
-                  uint64_t playerPtr = readMemory(entityListPtr + (i * 8), 8);
-                  if (playerPtr == 0) {
-                      continue;
-                  }
-                  uint64_t boneManager = readMemory(playerPtr + 0x150, 8);
-                  if (boneManager == 0) {
-                      continue;
-                  }
-                  uint64_t boneArray = readMemory(boneManager + 0x20, 8);
-                  if (boneArray == 0) {
-                      continue;
-                  }
-                  float x = 0.0f, y = 0.0f, z = 0.0f;
-                  uint32_t boneCount = readMemory(boneManager + 0x28, 4);
-                  if (boneCount > 32) {
-                      boneCount = 32;
-                  }
-                  for (int j = 0; j < boneCount; j++) {
-                      PlayerBone bone;
-                      bone.address = boneArray + (j * 0x30);
-                      bone.offset = j;
-                      float *boneData = (float *)readMemory(bone.address + 0x10, 12);
-                      if (boneData != NULL) {
-                          bone.x = boneData[0];
-                          bone.y = boneData[1];
-                          bone.z = boneData[2];
-                      }
-                      players[playerCount].bones[j] = bone;
-                  }
-                  players[playerCount].boneCount = boneCount;
-                  players[playerCount].baseAddress = playerPtr;
-                  playerCount++;
-                  if (playerCount >= 64) {
-                      break;
-                  }
-              }
+              
+              [self lagfix_setNeedsLayout];
           }
 
-          void aimLock() {
-              scanPlayers();
-              if (playerCount == 0) {
-                  return;
-              }
-              uint64_t base = getBaseAddress();
-              uint64_t viewMatrixPtr = base + 0x2B8C4A0;
-              float *viewMatrix = (float *)readMemory(viewMatrixPtr, 64);
-              if (viewMatrix == NULL) {
-                  return;
-              }
-              float targetX = 0.0f, targetY = 0.0f, targetZ = 0.0f;
-              int targetIndex = -1;
-              float minDistance = 999999.0f;
-              for (int i = 0; i < playerCount; i++) {
-                  if (players[i].boneCount == 0) {
-                      continue;
-                  }
-                  float headX = players[i].bones[0].x;
-                  float headY = players[i].bones[0].y;
-                  float headZ = players[i].bones[0].z;
-                  if (headX == 0.0f && headY == 0.0f && headZ == 0.0f) {
-                      continue;
-                  }
-                  float dist = sqrtf((headX * headX) + (headY * headY) + (headZ * headZ));
-                  if (dist < minDistance) {
-                      minDistance = dist;
-                      targetX = headX;
-                      targetY = headY;
-                      targetZ = headZ;
-                      targetIndex = i;
-                  }
-              }
-              if (targetIndex == -1) {
-                  return;
-              }
-              uint64_t cameraPtr = base + 0x2B8C4C0;
-              float *cameraPos = (float *)readMemory(cameraPtr, 12);
-              if (cameraPos == NULL) {
-                  return;
-              }
-              float camX = cameraPos[0];
-              float camY = cameraPos[1];
-              float camZ = cameraPos[2];
-              float dx = targetX - camX;
-              float dy = targetY - camY;
-              float dz = targetZ - camZ;
-              float yaw = atan2f(dy, dx);
-              float pitch = atan2f(dz, sqrtf((dx * dx) + (dy * dy)));
-              uint64_t viewAnglesPtr = base + 0x2B8C4E0;
-              float currentYaw = 0.0f, currentPitch = 0.0f;
-              float *viewAngles = (float *)readMemory(viewAnglesPtr, 8);
-              if (viewAngles != NULL) {
-                  currentYaw = viewAngles[0];
-                  currentPitch = viewAngles[1];
-              }
-              float smoothYaw = (yaw - currentYaw) * 0.2f;
-              float smoothPitch = (pitch - currentPitch) * 0.2f;
-              float newYaw = currentYaw + smoothYaw;
-              float newPitch = currentPitch + smoothPitch;
-              float writeData[2] = {newYaw, newPitch};
-              writeMemory(viewAnglesPtr, &writeData, 8);
+          @end
+
+          #pragma mark - Swizzling UIViewController
+          @interface UIViewController (LagFix)
+          - (void)lagfix_viewDidLoad;
+          - (void)lagfix_viewWillAppear:(BOOL)animated;
+          - (void)lagfix_viewDidDisappear:(BOOL)animated;
+          @end
+
+          @implementation UIViewController (LagFix)
+
+          + (void)load {
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{
+                  Class class = [self class];
+                  
+                  // Swizzle viewDidLoad
+                  SEL originalDidLoadSelector = @selector(viewDidLoad);
+                  SEL swizzledDidLoadSelector = @selector(lagfix_viewDidLoad);
+                  Method originalDidLoadMethod = class_getInstanceMethod(class, originalDidLoadSelector);
+                  Method swizzledDidLoadMethod = class_getInstanceMethod(class, swizzledDidLoadSelector);
+                  method_exchangeImplementations(originalDidLoadMethod, swizzledDidLoadMethod);
+                  
+                  // Swizzle viewWillAppear:
+                  SEL originalWillAppearSelector = @selector(viewWillAppear:);
+                  SEL swizzledWillAppearSelector = @selector(lagfix_viewWillAppear:);
+                  Method originalWillAppearMethod = class_getInstanceMethod(class, originalWillAppearSelector);
+                  Method swizzledWillAppearMethod = class_getInstanceMethod(class, swizzledWillAppearSelector);
+                  method_exchangeImplementations(originalWillAppearMethod, swizzledWillAppearMethod);
+                  
+                  // Swizzle viewDidDisappear:
+                  SEL originalDidDisappearSelector = @selector(viewDidDisappear:);
+                  SEL swizzledDidDisappearSelector = @selector(lagfix_viewDidDisappear:);
+                  Method originalDidDisappearMethod = class_getInstanceMethod(class, originalDidDisappearSelector);
+                  Method swizzledDidDisappearMethod = class_getInstanceMethod(class, swizzledDidDisappearSelector);
+                  method_exchangeImplementations(originalDidDisappearMethod, swizzledDidDisappearMethod);
+              });
           }
 
-          void *aimLockThread(void *arg) {
-              while (1) {
-                  usleep(10000);
-                  @autoreleasepool {
-                      aimLock();
+          - (void)lagfix_viewDidLoad {
+              NSString *iosVersion = [[UIDevice currentDevice] systemVersion];
+              float version = [iosVersion floatValue];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  // Tắt animation mặc định của navigation controller
+                  if (self.navigationController) {
+                      self.navigationController.view.layer.speed = 0.95;
                   }
+                  
+                  // Giảm chất lượng hiển thị để tăng FPS
+                  self.view.layer.opaque = YES;
+                  self.view.layer.contentsScale = [UIScreen mainScreen].scale;
+                  
+                  // Vô hiệu hóa autoresizing mask để giảm tính toán
+                  self.view.autoresizesSubviews = NO;
               }
-              return NULL;
+              
+              [self lagfix_viewDidLoad];
           }
 
-          __attribute__((constructor)) void init() {
-              taskPort = mach_task_self();
-              pthread_t thread;
-              pthread_create(&thread, NULL, aimLockThread, NULL);
-              pthread_detach(thread);
+          - (void)lagfix_viewWillAppear:(BOOL)animated {
+              NSString *iosVersion = [[UIDevice currentDevice] systemVersion];
+              float version = [iosVersion floatValue];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  // Tăng ưu tiên cho luồng chính để xử lý UI
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      [[FrameRateManager sharedManager] adjustFrameRateForCurrentConditions];
+                  });
+                  
+                  // Vô hiệu hóa hiệu ứng mờ động
+                  self.view.window.tintAdjustmentMode = UIViewTintAdjustmentModeNormal;
+              }
+              
+              [self lagfix_viewWillAppear:animated];
           }
-          EOF
 
-      - name: Write Entitlements File
+          - (void)lagfix_viewDidDisappear:(BOOL)animated {
+              NSString *iosVersion = [[UIDevice currentDevice] systemVersion];
+              float version = [iosVersion floatValue];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  // Dừng giới hạn khung hình khi rời khỏi màn hình
+                  [[FrameRateManager sharedManager] stopFrameLimiting];
+              }
+              
+              [self lagfix_viewDidDisappear:animated];
+          }
+
+          @end
+
+          #pragma mark - Hook vào UIApplication để khởi tạo patch
+          __attribute__((constructor))
+          static void InitializeLagFixPatch() {
+              NSString *iosVersion = [[UIDevice currentDevice] systemVersion];
+              float version = [iosVersion floatValue];
+              
+              if (version >= 14.0 && version <= 16.61) {
+                  NSLog(@"[LagFix] Kích hoạt bản vá cho iOS %.2f trên ứng dụng SmartCleaner", version);
+                  
+                  // Đăng ký observer để theo dõi trạng thái pin
+                  [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceBatteryStateDidChangeNotification
+                                                                    object:nil
+                                                                     queue:[NSOperationQueue mainQueue]
+                                                                usingBlock:^(NSNotification * _Nonnull note) {
+                      [[FrameRateManager sharedManager] adjustFrameRateForCurrentConditions];
+                  }];
+                  
+                  // Đăng ký observer khi ứng dụng vào background để giải phóng tài nguyên
+                  [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                                    object:nil
+                                                                     queue:[NSOperationQueue mainQueue]
+                                                                usingBlock:^(NSNotification * _Nonnull note) {
+                      [[FrameRateManager sharedManager] stopFrameLimiting];
+                  }];
+              }
+          }
+          ENDOFPATCH
+
+          echo "PATCH_SOURCE_PATH=PatchSource/LagFix.m" >> $GITHUB_ENV
+
+      - name: Create Info.plist for patch framework
         run: |
-          cat > entitlements.plist << 'EOF'
+          cat > PatchSource/Info.plist << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-              <key>com.apple.security.cs.disable-library-validation</key>
-              <true/>
-              <key>com.apple.security.cs.allow-jit</key>
-              <true/>
-              <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-              <true/>
-              <key>com.apple.security.device.microphone</key>
-              <true/>
-              <key>com.apple.security.device.camera</key>
-              <true/>
-              <key>com.apple.security.files.user-selected.read-only</key>
-              <true/>
-              <key>com.apple.security.files.user-selected.read-write</key>
-              <true/>
-              <key>com.apple.security.network.client</key>
-              <true/>
-              <key>com.apple.security.network.server</key>
-              <true/>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>en</string>
+              <key>CFBundleExecutable</key>
+              <string>LagFix</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.smartcleaner.lagfix</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>LagFix</string>
+              <key>CFBundlePackageType</key>
+              <string>FMWK</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>MinimumOSVersion</key>
+              <string>14.0</string>
           </dict>
           </plist>
           EOF
 
-      - name: Build Universal Binary
+      - name: Integrate patch into Xcode project
         run: |
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          ARCH_FLAGS="-arch arm64"
-          clang -dynamiclib \
-                -arch arm64 \
-                -isysroot $SDK_PATH \
-                -framework Foundation \
-                -framework UIKit \
-                -framework CoreGraphics \
-                -framework QuartzCore \
-                -framework CoreMedia \
-                -framework AVFoundation \
-                -framework OpenGLES \
-                -framework Metal \
-                -framework MetalKit \
-                -framework CoreImage \
-                -framework CoreVideo \
-                -framework CoreAudio \
-                -framework AudioToolbox \
-                -framework MediaPlayer \
-                -framework GameController \
-                -miphoneos-version-min=13.0 \
-                -O3 \
-                -Wall \
-                -Werror \
-                -current_version 1.0 \
-                -compatibility_version 1.0 \
-                -o libAimlock.dylib \
-                Sources/Aimlock.m
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          PROJECT_PATH="${APP_NAME}.xcodeproj"
+          
+          if [ ! -d "$PROJECT_PATH" ]; then
+            echo "Lỗi: Không tìm thấy dự án Xcode với tên $APP_NAME"
+            exit 1
+          fi
+          
+          ruby << RUBYSCRIPT
+          require 'xcodeproj'
+          
+          project_path = '$PROJECT_PATH'
+          project = Xcodeproj::Project.open(project_path)
+          
+          # Tìm target đầu tiên (thường là ứng dụng chính)
+          target = project.targets.first
+          
+          # Tạo nhóm PatchSources trong project
+          main_group = project.main_group
+          patch_group = main_group.find_subpath('PatchSources', true)
+          
+          # Thêm file LagFix.m vào nhóm
+          file_ref = patch_group.new_reference('PatchSource/LagFix.m')
+          file_ref.last_known_file_type = 'sourcecode.c.objc'
+          
+          # Thêm file vào build phase của target
+          target.source_build_phase.add_file_reference(file_ref, true)
+          
+          # Thêm Info.plist cho framework (nếu cần)
+          info_plist_ref = patch_group.new_reference('PatchSource/Info.plist')
+          
+          # Thêm các framework cần thiết
+          frameworks_group = project.frameworks_group
+          ['UIKit.framework', 'QuartzCore.framework', 'Metal.framework'].each do |framework_name|
+            framework_ref = frameworks_group.new_file(framework_name)
+            target.frameworks_build_phase.add_file_reference(framework_ref, true)
+          end
+          
+          # Cập nhật build settings để hỗ trợ Objective-C runtime
+          target.build_configurations.each do |config|
+            config.build_settings['OTHER_LDFLAGS'] = ['-ObjC', '-lobjc']
+            config.build_settings['CLANG_ENABLE_OBJC_ARC'] = 'YES'
+            config.build_settings['GCC_OPTIMIZATION_LEVEL'] = '3'  # Tối ưu hóa tối đa
+          end
+          
+          project.save
+          RUBYSCRIPT
 
-      - name: Sign Binary
+      - name: Build patched application
         run: |
-          codesign --force --timestamp --entitlements entitlements.plist -s "Apple Development: " libAimlock.dylib
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          CONFIG="${{ github.event.inputs.build_configuration }}"
+          
+          xcodebuild clean build \
+            -project "${APP_NAME}.xcodeproj" \
+            -scheme "${APP_NAME}" \
+            -configuration "${CONFIG}" \
+            -sdk iphoneos \
+            -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            GCC_PREPROCESSOR_DEFINITIONS='LAG_FIX_ENABLED=1'
 
-      - name: Verify Signature
+      - name: Create .app bundle structure
         run: |
-          codesign --verify libAimlock.dylib
-          otool -L libAimlock.dylib
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          CONFIG="${{ github.event.inputs.build_configuration }}"
+          APP_PATH="build/${CONFIG}-iphoneos/${APP_NAME}.app"
+          
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Lỗi: Không tìm thấy ứng dụng đã build tại $APP_PATH"
+            exit 1
+          fi
+          
+          # Sao chép thư viện vá vào bundle
+          mkdir -p "${APP_PATH}/Frameworks"
+          cp -r PatchSource "${APP_PATH}/Frameworks/"
+          
+          # Kiểm tra kích thước tệp
+          APP_SIZE=$(du -sh "$APP_PATH" | awk '{print $1}')
+          echo "Kích thước ứng dụng: $APP_SIZE"
 
-      - name: Upload Artifact
+      - name: Generate IPA file
+        run: |
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          CONFIG="${{ github.event.inputs.build_configuration }}"
+          APP_PATH="build/${CONFIG}-iphoneos/${APP_NAME}.app"
+          
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          
+          # Tạo IPA với timestamp
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          IPA_NAME="${APP_NAME}_Patched_iOS14-16.6.1_${TIMESTAMP}.ipa"
+          zip -r "$IPA_NAME" Payload/
+          
+          # Lưu tên file IPA để upload
+          echo "IPA_NAME=$IPA_NAME" >> $GITHUB_ENV
+
+      - name: Verify patch integration
+        run: |
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          CONFIG="${{ github.event.inputs.build_configuration }}"
+          APP_PATH="build/${CONFIG}-iphoneos/${APP_NAME}.app"
+          
+          # Kiểm tra file binary có chứa symbol của patch không
+          BINARY_PATH="${APP_PATH}/${APP_NAME}"
+          if [ -f "$BINARY_PATH" ]; then
+            if strings "$BINARY_PATH" | grep -q "LagFix"; then
+              echo "✅ Patch đã được tích hợp thành công"
+            else
+              echo "⚠️ Cảnh báo: Không tìm thấy symbol LagFix trong binary"
+            fi
+          else
+            echo "Lỗi: Binary không tồn tại"
+            exit 1
+          fi
+
+      - name: Upload patched IPA
         uses: actions/upload-artifact@v4
         with:
-          name: libAimlock
-          path: libAimlock.dylib
+          name: SmartCleaner_Patched_iOS14-16.6.1
+          path: ${{ env.IPA_NAME }}
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ~/Library/Logs/DiagnosticReports/
+            ~/Library/Logs/Xcode/*.log
           retention-days: 7
